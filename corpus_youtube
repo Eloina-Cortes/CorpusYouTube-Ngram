@@ -1,0 +1,191 @@
+from youtube_comment_downloader import YoutubeCommentDownloader
+import csv
+import re
+import unicodedata
+
+# Configuración
+IDIOMA_OBJETIVO = "es"       # "es" = español, "en" = inglés, None = todos los legibles
+MAX_COMENTARIOS = 300        # máximo por video
+LONGITUD_MINIMA = 10         # descartar comentarios muy cortos (basura)
+
+
+PALABRAS_ES = {
+    "que","de","la","el","en","y","los","del","se","las","un","por","con",
+    "una","su","para","es","al","lo","como","más","pero","sus","le","ya",
+    "o","este","fue","ha","me","si","no","todo","esta","muy","también",
+    "era","mucho","hay","donde","quien","cual","son","bien","cuando",
+    "todo","gracias","videos","video","bueno","buena","me","gusta",
+}
+
+PALABRAS_EN = {
+    "the","be","to","of","and","a","in","that","have","it","for","not",
+    "on","with","he","as","you","do","at","this","but","his","by","from",
+    "they","we","say","her","she","or","an","will","my","one","all",
+    "would","there","their","what","so","up","out","if","about","who",
+    "get","which","go","me","when","make","can","like","time","no","just",
+    "him","know","take","people","into","year","your","good","some","could",
+    "them","see","other","than","then","now","look","only","come","its",
+    "over","think","also","back","after","use","two","how","our","work",
+    "first","well","way","even","new","want","because","any","these","give",
+    "day","most","us","great","love","thanks","video","watch",
+}
+
+def detectar_idioma(texto):
+    """Detección rápida de idioma por vocabulario. Devuelve 'es', 'en' u 'otro'."""
+    palabras = set(re.findall(r'\b[a-záéíóúüñ]+\b', texto.lower()))
+    if not palabras:
+        return "otro"
+    hits_es = len(palabras & PALABRAS_ES)
+    hits_en = len(palabras & PALABRAS_EN)
+    total = len(palabras)
+    if hits_es / total > 0.15 or hits_es > hits_en + 1:
+        return "es"
+    if hits_en / total > 0.15 or hits_en > hits_es + 1:
+        return "en"
+    return "otro"
+
+# Verificar que el texto sea legible
+
+
+def es_texto_legible(texto):
+
+    if not texto or len(texto) < LONGITUD_MINIMA:
+        return False
+
+    # Contar caracteres por categoría unicode
+    total = len(texto)
+    latinos = sum(1 for c in texto if unicodedata.category(c) in ('Ll','Lu','Lt','Lm'))
+    otros_scripts = sum(
+        1 for c in texto
+        if unicodedata.category(c).startswith('L')
+        and not unicodedata.name(c, '').startswith(('LATIN','SPACE'))
+        and ord(c) > 127
+    )
+
+    # Si más del 30% son caracteres de otros scripts → probablemente no es español/inglés
+    if total > 0 and otros_scripts / total > 0.30:
+        return False
+
+    # Detectar mojibake típico: secuencias Ã, Ø, â seguidas de símbolos raros
+    if re.search(r'[ÃØâÙ]{2,}', texto):
+        return False
+
+    # Debe tener al menos algunas letras latinas
+    if latinos < 3:
+        return False
+
+    return True
+
+# Se procede a Limpiar comentario
+
+def limpiar_texto(texto):
+    if not texto:
+        return ""
+
+    # 1. Normalizar unicode (NFC) — arregla muchos casos de caracteres compuestos
+    texto = unicodedata.normalize("NFC", texto)
+
+    # 2. Minúsculas
+    texto = texto.lower()
+
+    # 3. Quitar emojis unicode
+    emoji_pattern = re.compile(
+        "["
+        u"\U0001F300-\U0001FAFF"
+        u"\U00002600-\U000027BF"
+        u"\U0000FE00-\U0000FE0F"  # variantes de selector
+        u"\U00003000-\U00003300"
+        "]+",
+        flags=re.UNICODE
+    )
+    texto = emoji_pattern.sub('', texto)
+
+    # 4. Quitar secuencias de escape y caracteres de control
+    texto = re.sub(r'[\x00-\x1F\x7F]', '', texto)
+
+    # 5. Quitar URLs
+    texto = re.sub(r'http\S+|www\S+', '', texto)
+
+    # 6. Quitar menciones @usuario
+    texto = re.sub(r'@\w+', '', texto)
+
+    # 7. Quitar hashtags
+    texto = re.sub(r'#\w+', '', texto)
+
+    # 8. Quitar caracteres no latinos (árabe, tailandés, etc.)
+    # Conserva letras latinas, números, puntuación básica y acentos del español
+    texto = re.sub(r'[^\x20-\x7E\u00C0-\u024F\u00A1-\u00FF]', '', texto)
+
+    # 9. Espacios extra
+    texto = re.sub(r'\s+', ' ', texto).strip()
+
+    return texto
+
+
+# la lista de archivos en archivo txt
+
+with open("canciones.txt", "r", encoding="utf-8") as f:
+    videos = [line.strip() for line in f if line.strip()]
+
+downloader = YoutubeCommentDownloader()
+
+total_guardados = 0
+total_descartados = 0
+
+with open("corpus_youtube.csv", "w", newline="", encoding="utf-8-sig") as f:
+    # utf-8-sig añade BOM para que Excel lo abra correctamente
+    writer = csv.writer(f)
+    writer.writerow([
+        "video_url",
+        "comentario",
+        "autor",
+        "likes",
+        "fecha",
+        "idioma"
+    ])
+
+    for url in videos:
+        print(f"\nProcesando: {url}")
+        guardados_video = 0
+
+        try:
+            comments = downloader.get_comments_from_url(url)
+            for c in comments:
+                if guardados_video >= MAX_COMENTARIOS:
+                    break
+
+                texto_original = c.get("text", "")
+                comentario_limpio = limpiar_texto(texto_original)
+
+                # Filtrar textos ilegibles o muy cortos
+                if not es_texto_legible(comentario_limpio):
+                    total_descartados += 1
+                    continue
+
+                # Detectar idioma
+                idioma = detectar_idioma(comentario_limpio)
+
+                # Si se definió un idioma objetivo, filtrar
+                if IDIOMA_OBJETIVO and idioma != IDIOMA_OBJETIVO:
+                    total_descartados += 1
+                    continue
+
+                writer.writerow([
+                    url,
+                    comentario_limpio,
+                    c.get("author", ""),
+                    c.get("votes", 0),
+                    c.get("time", ""),
+                    idioma
+                ])
+                guardados_video += 1
+                total_guardados += 1
+
+            print(f"  → {guardados_video} comentarios guardados de este video")
+
+        except Exception as e:
+            print(f"  Error con {url}: {e}")
+
+print(f"\n Corpus terminado")
+print(f"  Guardados:   {total_guardados}")
+print(f"  Descartados: {total_descartados}")
